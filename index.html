@@ -3,10 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>GitHub Actions Latest Logs Viewer</title>
+  <title>GitHub Actions Viewer</title>
   <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@octokit/core@5/dist-web/octokit.min.js"></script>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body>
@@ -15,105 +16,112 @@
     const { useState, useEffect } = React;
 
     function App() {
-      const [username, setUsername] = useState('');
+      const [token, setToken] = useState('');
       const [repos, setRepos] = useState([]);
-      const [latestRuns, setLatestRuns] = useState([]);
+      const [selectedRepo, setSelectedRepo] = useState(null);
+      const [workflows, setWorkflows] = useState([]);
+      const [runs, setRuns] = useState([]);
+      const [logs, setLogs] = useState(null);
       const [error, setError] = useState(null);
       const [loading, setLoading] = useState(false);
 
-      // Fetch public repositories and their latest runs
+      const octokit = token ? new Octokit.Core({ auth: token }) : null;
+
+      // Fetch repositories
       useEffect(() => {
-        if (!username) {
-          setRepos([]);
-          setLatestRuns([]);
-          setError(null);
-          return;
-        }
+        if (!token) return;
         setLoading(true);
-        setError(null);
-        setRepos([]);
-        setLatestRuns([]);
-
-        // Fetch public repositories
-        fetch(`https://api.github.com/users/${username}/repos?type=public&sort=updated&per_page=100`, {
-          headers: { Accept: 'application/vnd.github+json' },
-        })
-          .then((res) => {
-            if (!res.ok) throw new Error(res.status === 404 ? 'User not found' : 'Failed to fetch repositories');
-            return res.json();
+        octokit
+          .request('GET /user/repos', { sort: 'updated', per_page: 100 })
+          .then(({ data }) => {
+            setRepos(data);
+            setError(null);
           })
-          .then(async (data) => {
-            const publicRepos = data.filter((repo) => !repo.fork); // Exclude forks
-            setRepos(publicRepos);
-
-            // Fetch latest run for each repo
-            const runs = [];
-            for (const repo of publicRepos) {
-              try {
-                // Get latest workflow run
-                const runRes = await fetch(
-                  `https://api.github.com/repos/${repo.full_name}/actions/runs?per_page=1`,
-                  { headers: { Accept: 'application/vnd.github+json' } }
-                );
-                if (!runRes.ok) continue; // Skip repos without runs or access
-                const runData = await runRes.json();
-                if (runData.workflow_runs.length === 0) continue;
-
-                const run = runData.workflow_runs[0];
-
-                // Get workflow details to fetch workflow name
-                const workflowRes = await fetch(
-                  `https://api.github.com/repos/${repo.full_name}/actions/workflows/${run.workflow_id}`,
-                  { headers: { Accept: 'application/vnd.github+json' } }
-                );
-                const workflowData = workflowRes.ok ? await workflowRes.json() : { name: 'Unknown Workflow' };
-
-                // Get logs
-                let logs = null;
-                try {
-                  const logRes = await fetch(
-                    `https://api.github.com/repos/${repo.full_name}/actions/runs/${run.id}/logs`,
-                    { headers: { Accept: 'application/vnd.github+json' } }
-                  );
-                  if (logRes.ok) {
-                    logs = await logRes.text();
-                  }
-                } catch (logErr) {
-                  // Logs may not be accessible; continue without them
-                }
-
-                runs.push({
-                  repo: repo.full_name,
-                  run,
-                  workflowName: workflowData.name,
-                  logs,
-                });
-              } catch (err) {
-                // Skip individual repo errors
-              }
-            }
-            setLatestRuns(runs.sort((a, b) => new Date(b.run.created_at) - new Date(a.run.created_at)));
-          })
-          .catch((err) => setError(err.message))
+          .catch((err) => setError('Failed to fetch repositories: ' + err.message))
           .finally(() => setLoading(false));
-      }, [username]);
+      }, [token]);
+
+      // Fetch workflows for selected repo
+      useEffect(() => {
+        if (!selectedRepo) return;
+        setLoading(true);
+        octokit
+          .request('GET /repos/{owner}/{repo}/actions/workflows', {
+            owner: selectedRepo.owner.login,
+            repo: selectedRepo.name,
+          })
+          .then(({ data }) => {
+            setWorkflows(data.workflows);
+            setRuns([]);
+            setLogs(null);
+            setError(null);
+          })
+          .catch((err) => setError('Failed to fetch workflows: ' + err.message))
+          .finally(() => setLoading(false));
+      }, [selectedRepo]);
+
+      // Fetch workflow runs
+      const fetchRuns = async (workflowId) => {
+        setLoading(true);
+        try {
+          const { data } = await octokit.request('GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs', {
+            owner: selectedRepo.owner.login,
+            repo: selectedRepo.name,
+            workflow_id: workflowId,
+          });
+          setRuns(data.workflow_runs);
+          setLogs(null);
+          setError(null);
+        } catch (err) {
+          setError('Failed to fetch runs: ' + err.message);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      // Fetch logs for a run
+      const fetchLogs = async (runId) => {
+        setLoading(true);
+        try {
+          const { headers } = await octokit.request('GET /repos/{owner}/{repo}/actions/runs/{run_id}/logs', {
+            owner: selectedRepo.owner.login,
+            repo: selectedRepo.name,
+            run_id: runId,
+            headers: { accept: 'application/vnd.github+json' },
+          });
+          const logUrl = headers.location; // Redirect URL for logs
+          const response = await fetch(logUrl, {
+            headers: { Authorization: `Bearer ${token}` },
+          });
+          const logText = await response.text();
+          setLogs(logText);
+          setError(null);
+        } catch (err) {
+          setError('Failed to fetch logs: ' + err.message);
+        } finally {
+          setLoading(false);
+        }
+      };
 
       return (
         <div className="container mx-auto p-4">
-          <h1 className="text-3xl font-bold mb-4">GitHub Actions Latest Logs Viewer</h1>
+          <h1 className="text-3xl font-bold mb-4">GitHub Actions Viewer</h1>
 
-          {/* Username Input */}
+          {/* Token Input */}
           <div className="mb-4">
-            <label className="block text-sm font-medium">GitHub Username</label>
+            <label className="block text-sm font-medium">GitHub Personal Access Token</label>
             <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value.trim())}
+              type="password"
+              value={token}
+              onChange={(e) => setToken(e.target.value)}
               className="mt-1 p-2 border rounded w-full"
-              placeholder="Enter a GitHub username (e.g., octocat)"
+              placeholder="Enter your GitHub PAT"
             />
             <p className="text-sm text-gray-500 mt-1">
-              Shows the latest public GitHub Actions logs for the user's public repositories.
+              Create a token with <code>repo</code> and <code>workflow</code> scopes at{' '}
+              <a href="https://github.com/settings/tokens" target="_blank" className="text-blue-500">
+                GitHub Settings
+              </a>.
             </p>
           </div>
 
@@ -123,40 +131,74 @@
           {/* Loading Indicator */}
           {loading && <div className="text-center">Loading...</div>}
 
-          {/* Latest Runs and Logs */}
-          {latestRuns.length > 0 && (
+          {/* Repository List */}
+          {repos.length > 0 && (
             <div className="mb-4">
-              <h2 className="text-xl font-semibold mb-2">Latest Workflow Runs</h2>
+              <h2 className="text-xl font-semibold">Repositories</h2>
+              <select
+                onChange={(e) => setSelectedRepo(repos.find((r) => r.full_name === e.target.value))}
+                className="mt-2 p-2 border rounded w-full"
+              >
+                <option value="">Select a repository</option>
+                {repos.map((repo) => (
+                  <option key={repo.id} value={repo.full_name}>
+                    {repo.full_name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {/* Workflow List */}
+          {workflows.length > 0 && (
+            <div className="mb-4">
+              <h2 className="text-xl font-semibold">Workflows</h2>
+              <ul className="list-disc pl-5">
+                {workflows.map((workflow) => (
+                  <li key={workflow.id} className="mt-2">
+                    <button
+                      onClick={() => fetchRuns(workflow.id)}
+                      className="text-blue-500 hover:underline"
+                    >
+                      {workflow.name}
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Workflow Runs */}
+          {runs.length > 0 && (
+            <div className="mb-4">
+              <h2 className="text-xl font-semibold">Workflow Runs</h2>
               <div className="grid grid-cols-1 gap-4">
-                {latestRuns.map(({ repo, run, workflowName, logs }, index) => (
-                  <div key={`${repo}-${run.id}`} className="border p-4 rounded">
-                    <h3 className="text-lg font-medium">
-                      {repo} - {workflowName}
-                    </h3>
+                {runs.map((run) => (
+                  <div key={run.id} className="border p-4 rounded">
                     <p>
                       <strong>Run #{run.run_number}</strong> - {run.status} ({run.conclusion || 'N/A'})
                     </p>
                     <p className="text-sm text-gray-500">
                       {new Date(run.created_at).toLocaleString()}
                     </p>
-                    {logs ? (
-                      <div className="mt-2">
-                        <h4 className="text-sm font-semibold">Logs</h4>
-                        <pre className="bg-gray-100 p-4 rounded overflow-auto max-h-96 text-sm">
-                          {logs}
-                        </pre>
-                      </div>
-                    ) : (
-                      <p className="text-sm text-gray-500 mt-2">No logs available</p>
-                    )}
+                    <button
+                      onClick={() => fetchLogs(run.id)}
+                      className="mt-2 bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+                    >
+                      View Logs
+                    </button>
                   </div>
                 ))}
               </div>
             </div>
           )}
 
-          {repos.length > 0 && latestRuns.length === 0 && !loading && (
-            <div className="text-gray-500">No public workflow runs found for this user's repositories.</div>
+          {/* Logs Display */}
+          {logs && (
+            <div>
+              <h2 className="text-xl font-semibold">Logs</h2>
+              <pre className="bg-gray-100 p-4 rounded overflow-auto max-h-96">{logs}</pre>
+            </div>
           )}
         </div>
       );

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GitHub Actions Latest Logs Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    function App() {
+      const [username, setUsername] = useState('');
+      const [repos, setRepos] = useState([]);
+      const [latestRuns, setLatestRuns] = useState([]);
+      const [error, setError] = useState(null);
+      const [loading, setLoading] = useState(false);
+
+      // Fetch public repositories and their latest runs
+      useEffect(() => {
+        if (!username) {
+          setRepos([]);
+          setLatestRuns([]);
+          setError(null);
+          return;
+        }
+        setLoading(true);
+        setError(null);
+        setRepos([]);
+        setLatestRuns([]);
+
+        // Fetch public repositories
+        fetch(`https://api.github.com/users/${username}/repos?type=public&sort=updated&per_page=100`, {
+          headers: { Accept: 'application/vnd.github+json' },
+        })
+          .then((res) => {
+            if (!res.ok) throw new Error(res.status === 404 ? 'User not found' : 'Failed to fetch repositories');
+            return res.json();
+          })
+          .then(async (data) => {
+            const publicRepos = data.filter((repo) => !repo.fork); // Exclude forks
+            setRepos(publicRepos);
+
+            // Fetch latest run for each repo
+            const runs = [];
+            for (const repo of publicRepos) {
+              try {
+                // Get latest workflow run
+                const runRes = await fetch(
+                  `https://api.github.com/repos/${repo.full_name}/actions/runs?per_page=1`,
+                  { headers: { Accept: 'application/vnd.github+json' } }
+                );
+                if (!runRes.ok) continue; // Skip repos without runs or access
+                const runData = await runRes.json();
+                if (runData.workflow_runs.length === 0) continue;
+
+                const run = runData.workflow_runs[0];
+
+                // Get workflow details to fetch workflow name
+                const workflowRes = await fetch(
+                  `https://api.github.com/repos/${repo.full_name}/actions/workflows/${run.workflow_id}`,
+                  { headers: { Accept: 'application/vnd.github+json' } }
+                );
+                const workflowData = workflowRes.ok ? await workflowRes.json() : { name: 'Unknown Workflow' };
+
+                // Get logs
+                let logs = null;
+                try {
+                  const logRes = await fetch(
+                    `https://api.github.com/repos/${repo.full_name}/actions/runs/${run.id}/logs`,
+                    { headers: { Accept: 'application/vnd.github+json' } }
+                  );
+                  if (logRes.ok) {
+                    logs = await logRes.text();
+                  }
+                } catch (logErr) {
+                  // Logs may not be accessible; continue without them
+                }
+
+                runs.push({
+                  repo: repo.full_name,
+                  run,
+                  workflowName: workflowData.name,
+                  logs,
+                });
+              } catch (err) {
+                // Skip individual repo errors
+              }
+            }
+            setLatestRuns(runs.sort((a, b) => new Date(b.run.created_at) - new Date(a.run.created_at)));
+          })
+          .catch((err) => setError(err.message))
+          .finally(() => setLoading(false));
+      }, [username]);
+
+      return (
+        <div className="container mx-auto p-4">
+          <h1 className="text-3xl font-bold mb-4">GitHub Actions Latest Logs Viewer</h1>
+
+          {/* Username Input */}
+          <div className="mb-4">
+            <label className="block text-sm font-medium">GitHub Username</label>
+            <input
+              type="text"
+              value={username}
+              onChange={(e) => setUsername(e.target.value.trim())}
+              className="mt-1 p-2 border rounded w-full"
+              placeholder="Enter a GitHub username (e.g., octocat)"
+            />
+            <p className="text-sm text-gray-500 mt-1">
+              Shows the latest public GitHub Actions logs for the user's public repositories.
+            </p>
+          </div>
+
+          {/* Error Display */}
+          {error && <div className="bg-red-100 text-red-700 p-4 rounded mb-4">{error}</div>}
+
+          {/* Loading Indicator */}
+          {loading && <div className="text-center">Loading...</div>}
+
+          {/* Latest Runs and Logs */}
+          {latestRuns.length > 0 && (
+            <div className="mb-4">
+              <h2 className="text-xl font-semibold mb-2">Latest Workflow Runs</h2>
+              <div className="grid grid-cols-1 gap-4">
+                {latestRuns.map(({ repo, run, workflowName, logs }, index) => (
+                  <div key={`${repo}-${run.id}`} className="border p-4 rounded">
+                    <h3 className="text-lg font-medium">
+                      {repo} - {workflowName}
+                    </h3>
+                    <p>
+                      <strong>Run #{run.run_number}</strong> - {run.status} ({run.conclusion || 'N/A'})
+                    </p>
+                    <p className="text-sm text-gray-500">
+                      {new Date(run.created_at).toLocaleString()}
+                    </p>
+                    {logs ? (
+                      <div className="mt-2">
+                        <h4 className="text-sm font-semibold">Logs</h4>
+                        <pre className="bg-gray-100 p-4 rounded overflow-auto max-h-96 text-sm">
+                          {logs}
+                        </pre>
+                      </div>
+                    ) : (
+                      <p className="text-sm text-gray-500 mt-2">No logs available</p>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {repos.length > 0 && latestRuns.length === 0 && !loading && (
+            <div className="text-gray-500">No public workflow runs found for this user's repositories.</div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
